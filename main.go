@@ -1,131 +1,119 @@
-/*
- * wp-import imports posts from WordPress into Write.as / WriteFreely.
- * Copyright © 2019 A Bunch Tell LLC.
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- */
-
 package main
 
 import (
-	"bytes"
+	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
-	"github.com/frankbille/go-wxr-import"
-	"github.com/writeas/go-writeas/v2"
-	"github.com/writeas/godown"
-	"io/ioutil"
 	"log"
 	"os"
-	"regexp"
+	"path/filepath"
+
+	"github.com/tstromberg/nykya/pkg/nykya"
+	"github.com/tstromberg/nykya/pkg/store"
+	"github.com/writeas/go-writeas/v2"
 )
 
 var (
-	commentReg = regexp.MustCompile("(?m)<!-- ([^m ]|m[^o ]|mo[^r ]|mor[^e ])+ -->\n?")
+	dryRunFlag   = flag.Bool("dry-run", false, "dry-run mode (don't buy/sell anything)")
+	instanceFlag = flag.String("instance", "https://write.as", "blog to post to")
+	fromDirFlag  = flag.String("from-dir", ".", "directory to import from")
 )
 
-func main() {
-	if len(os.Args) < 2 {
-		//errQuit("usage: wp-import https://write.as filename.xml")
-		errQuit("usage: wp-import filename.xml")
-	}
-	//instance := os.Args[1]
-	instance := "https://write.as"
-	fname := os.Args[1]
+type Config struct {
+	AccessToken string `json:"access_token"`
+}
 
-	// TODO: load user config from same func as writeas-cli
-	t := ""
-	if t == "" {
-		errQuit("not authenticated. run: writeas auth <username>")
+type Post struct {
+	FrontMatter nykya.FrontMatter
+	Content     string
+}
+
+func userConfig() (*Config, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("home dir: %v", err)
+	}
+
+	path := filepath.Join(home, ".writeas", "user.json")
+	log.Printf("reading token from %s ...", path)
+	bs, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %v", err)
+	}
+
+	var c Config
+	// we unmarshal our byteArray which contains our
+	// jsonFile's content into 'users' which we defined above
+	err = json.Unmarshal(bs, &c)
+	return &c, err
+}
+
+func gatherPosts(path string) ([]Post, error) {
+	log.Printf("gathering posts from %s ...", path)
+	ps := []Post{}
+
+	ctx := context.Background()
+	items, err := store.Scan(ctx, path)
+	if err != nil {
+		return ps, fmt.Errorf("scan: %w", err)
+	}
+	for _, i := range items {
+		if i.FrontMatter.Kind != "post" {
+			continue
+		}
+		if i.FrontMatter.Draft {
+			log.Printf("Skipping draft post: %s", i.ContentPath)
+			continue
+		}
+		if len(i.Inline) == 0 {
+			log.Printf("Skipping empty post: %s", i.ContentPath)
+			continue
+		}
+		ps = append(ps, Post{i.FrontMatter, i.Inline})
+	}
+
+	return ps, err
+}
+
+func main() {
+	flag.Parse()
+	cfg, err := userConfig()
+	if err != nil {
+		log.Fatalf("failed to load writeas-cli config: %v", err)
 	}
 
 	cl := writeas.NewClientWith(writeas.Config{
-		URL:   instance + "/api",
-		Token: t,
+		URL:   *instanceFlag + "/api",
+		Token: cfg.AccessToken,
 	})
 
-	// An application key is required on Write.as to skip API rate-limiting
-	appKey := ""
-	cl.SetApplicationKey(appKey)
+	posts, err := gatherPosts(*fromDirFlag)
+	if err != nil {
+		log.Fatalf("find posts: %v", err)
+	}
 
-	log.Printf("Reading %s...\n", fname)
-	raw, _ := ioutil.ReadFile(fname)
+	failed := []string{}
+	for _, p := range posts {
+		log.Printf("Uploading post %q from %s (%d bytes)", p.FrontMatter.Title, p.FrontMatter.Date, len(p.Content))
 
-	log.Println("Parsing...")
-	d := wxr.ParseWxr(raw)
-	log.Printf("Found %d channels.\n", len(d.Channels))
-
-	postsCount := 0
-
-	for _, ch := range d.Channels {
-		log.Printf("Channel: %s\n", ch.Title)
-
-		// Create the blog
-		c := &writeas.CollectionParams{
-			Title:       ch.Title,
-			Description: ch.Description,
+		if *dryRunFlag {
+			continue
 		}
-		log.Printf("Creating %s...\n", ch.Title)
-		coll, err := cl.CreateCollection(c)
+
+		pp := &writeas.PostParams{
+			Title:   p.FrontMatter.Title,
+			Content: p.Content,
+			Created: &p.FrontMatter.Date.Time,
+			Font:    "norm",
+		}
+		_, err = cl.CreatePost(pp)
 		if err != nil {
-			errQuit(err.Error())
-		}
-		log.Printf("Done!\n")
-
-		log.Printf("Found %d items.\n", len(ch.Items))
-		for _, wpp := range ch.Items {
-			if wpp.PostType != "post" {
-				continue
-			}
-
-			// Convert to Markdown
-			b := bytes.NewBufferString("")
-			r := bytes.NewReader([]byte(wpp.Content))
-			err = godown.Convert(b, r, nil)
-			con := b.String()
-
-			// Remove unneeded WordPress comments that take up space, like <!-- wp:paragraph -->
-			con = commentReg.ReplaceAllString(con, "")
-
-			// Append tags
-			tags := ""
-			sep := ""
-			for _, cat := range wpp.Categories {
-				if cat.Domain != "post_tag" {
-					continue
-				}
-				tags += sep + "#" + cat.DisplayName
-				sep = " "
-			}
-			if tags != "" {
-				con += "\n\n" + tags
-			}
-
-			p := &writeas.PostParams{
-				Title:      wpp.Title,
-				Slug:       wpp.PostName,
-				Content:    con,
-				Created:    &wpp.PostDateGmt,
-				Updated:    &wpp.PostDateGmt,
-				Font:       "norm",
-				Language:   &ch.Language,
-				Collection: coll.Alias,
-			}
-			log.Printf("Creating %s", p.Title)
-			_, err = cl.CreatePost(p)
-			if err != nil {
-				errQuit(fmt.Sprintf("create post: %s\n", err))
-			}
-
-			postsCount++
+			failed = append(failed, pp.Title)
+			log.Printf("create failed: %v", err)
+			log.Printf("failed content: %+v", pp)
 		}
 	}
-	log.Printf("Created %d posts.\n", postsCount)
-}
 
-func errQuit(m string) {
-	fmt.Fprintf(os.Stderr, m+"\n")
-	os.Exit(1)
+	log.Printf("%d of %d posts failed to upload: %v", len(failed), len(posts), failed)
 }
